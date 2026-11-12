@@ -1,0 +1,8 @@
+Harpia Manager - Executor UniPlay 0.5.0
+
+Baixe o instalador em https://harpiamanager.com nas Configuracoes.
+Abra o EXE e siga o assistente. O computador e vinculado automaticamente.
+O executor usa a conta do painel salva no Hub. Nenhuma chave precisa ser copiada.
+Pedidos IPTV liberados pelo Hub sao renovados no computador. O vencimento confirmado volta ao Hub.
+O executor inicia com o Windows. Mantenha o computador ligado e conectado.
+P2P permanece pendente ate haver executor validado.
