@@ -40,21 +40,28 @@ async function observeAndResolve(page, { autoSolve = true } = {}) {
   }
 
   try {
-    // ESTRATÉGIA A: Execução Invisível via JS
+    // FIX-1 — ESTRATÉGIA A: errorCallback resolve(null) em vez de reject()
+    // grecaptcha.execute() é para widgets invisible; em widgets v2 checkbox ele falha.
+    // Rejeitar aqui jogava todo o fluxo no catch e nunca chegava à Estratégia B.
+    // Agora resolve(null) garante que o fluxo continua normalmente para a Estratégia B.
     const token = await page.evaluate((key) => {
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
         if (typeof grecaptcha !== 'undefined') {
           const existing = grecaptcha.getResponse();
           if (existing && existing.length > 10) {
             resolve(existing);
           } else {
-            grecaptcha.execute(key, {
-              callback: (response) => resolve(response),
-              errorCallback: (err) => reject(new Error('grecaptcha_error: ' + err))
-            });
+            try {
+              grecaptcha.execute(key, {
+                callback: (response) => resolve(response || null),
+                errorCallback: () => resolve(null)   // FIX-1: não rejeita, apenas passa adiante
+              });
+            } catch {
+              resolve(null);                           // FIX-1: execute() lança em widget v2
+            }
           }
         } else {
-          reject(new Error('grecaptcha library not loaded'));
+          resolve(null);                               // FIX-1: biblioteca não carregada → Estratégia B
         }
       });
     }, siteKey);
@@ -63,20 +70,20 @@ async function observeAndResolve(page, { autoSolve = true } = {}) {
       return { state: 'ready', token };
     }
 
-    // ESTRATÉGIA B: Interação Visual (Checkbox e Desafios)
+    // ESTRATÉGIA B: Interação Visual (Checkbox → Áudio → Submit)
     const frame = page.frames().find(f => f.url().includes('recaptcha'));
     if (frame) {
       // 1. Tenta clicar no checkbox principal
-      const checkbox = frame.locator('input[type="checkbox"]').first();
+      const checkbox = frame.locator('#recaptcha-anchor, input[type="checkbox"]').first();
       if (await checkbox.isVisible()) {
         await checkbox.click({ timeout: 3000 });
       }
 
-      // 2. Aguarda a resolução ou a mudança para um desafio
+      // 2. Aguarda resolução rápida (bot score baixo → token direto)
       await page.waitForFunction(() => {
         const ta = document.querySelector('textarea[name="g-recaptcha-response"]');
         return ta && ta.value && ta.value.length > 10;
-      }, { timeout: 15000 }).catch(() => {});
+      }, { timeout: 5000 }).catch(() => {});
 
       // Verifica se resolveu após o clique
       const resolvedAfterClick = await page.locator('textarea[name="g-recaptcha-response"]').evaluateAll(
@@ -86,27 +93,42 @@ async function observeAndResolve(page, { autoSolve = true } = {}) {
         return { state: 'ready', token: await getToken(page) };
       }
 
-      // 3. Se não resolveu, verifica se há um desafio de áudio
-      const hasAudioChallenge = await frame.evaluate(() => {
+      // FIX-3 — Clica no botão de alternar para desafio de ÁUDIO antes de checar .rc-audiochallenge.
+      // O fluxo correto é: checkbox → modal de imagem aparece → clicar no botão de áudio
+      // → .rc-audiochallenge aparece. Sem este clique o código nunca chegava ao áudio.
+      const challengeFrame = page.frames().find(f => f.url().includes('recaptcha/api2/bframe'));
+      const targetFrame = challengeFrame || frame;
+
+      const audioSwitchBtn = targetFrame.locator(
+        '#recaptcha-audio-button, button[aria-label*="audio" i], button[title*="audio" i]'
+      ).first();
+
+      if (await audioSwitchBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await audioSwitchBtn.click();
+        // Aguarda o painel de áudio aparecer
+        await targetFrame.waitForSelector('.rc-audiochallenge', { timeout: 5000 }).catch(() => {});
+      }
+
+      // 3. Verifica se agora há desafio de áudio (após a troca ou se já veio direto)
+      const hasAudioChallenge = await targetFrame.evaluate(() => {
         return document.querySelector('.rc-audiochallenge') !== null;
       });
 
       if (hasAudioChallenge) {
-        return await solveAudioChallenge(page, frame);
+        return await solveAudioChallenge(page, targetFrame);
       }
 
-      // 4. Se não resolveu e não é áudio, provavelmente é mosaico
-      // Tenta verificar se há um botão "Verificar"
-      const verifyButton = frame.locator('button[aria-label="Verificar"]').first();
-      if (await verifyButton.isVisible()) {
-         await verifyButton.click().catch(() => {});
-         await page.waitForTimeout(2000);
-         const resolvedAfterVerify = await page.locator('textarea[name="g-recaptcha-response"]').evaluateAll(
+      // 4. Fallback: mosaico — tenta Verificar se o botão estiver visível
+      const verifyButton = targetFrame.locator('button[aria-label="Verificar"], button[aria-label="Verify"]').first();
+      if (await verifyButton.isVisible().catch(() => false)) {
+        await verifyButton.click().catch(() => {});
+        await page.waitForTimeout(2000);
+        const resolvedAfterVerify = await page.locator('textarea[name="g-recaptcha-response"]').evaluateAll(
           els => els.some(el => Boolean(el.value && el.value.trim()))
         );
-         if (resolvedAfterVerify) {
-           return { state: 'ready', token: await getToken(page) };
-         }
+        if (resolvedAfterVerify) {
+          return { state: 'ready', token: await getToken(page) };
+        }
       }
 
       return { state: 'required', reason: 'image_challenge_or_failed' };
@@ -121,52 +143,78 @@ async function observeAndResolve(page, { autoSolve = true } = {}) {
 
 async function solveAudioChallenge(page, frame) {
   try {
-    // 1. Dispara a reprodução do áudio
-    const playButton = frame.locator('button[aria-label="Play audio"]').first();
-    if (await playButton.isVisible()) {
-      await playButton.click();
-    }
-
-    // 2. Captura o áudio
+    // FIX-2 — Registra o listener de resposta ANTES de clicar em Play.
+    // Antes o listener era registrado após o clique: a resposta HTTP do .mp3 já tinha passado
+    // e o Promise ficava preso até o timeout de 10 s, sempre rejeitando.
     const audioPromise = new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Audio capture timeout')), 10000);
-      const listener = async (response) => {
+      const timeout = setTimeout(() => {
+        page.off('response', listener);
+        reject(new Error('Audio capture timeout'));
+      }, 12000);
+
+      async function listener(response) {
         const url = response.url();
-        if (url.includes('/recaptcha/api2/audio') || url.includes('.mp3')) {
+        if (
+          url.includes('/recaptcha/api2/audio') ||
+          url.includes('recaptcha') && url.includes('.mp3') ||
+          url.includes('recaptcha') && url.includes('/payload')
+        ) {
           try {
             const buffer = await response.body();
+            if (buffer && buffer.length > 1000) {   // descarta respostas de erro (< 1 KB)
+              clearTimeout(timeout);
+              page.off('response', listener);
+              resolve(buffer);
+            }
+          } catch (err) {
             clearTimeout(timeout);
             page.off('response', listener);
-            resolve(buffer);
-          } catch (e) {
-            clearTimeout(timeout);
-            reject(e);
+            reject(err);
           }
         }
-      };
+      }
+
       page.on('response', listener);
     });
 
+    // Clica Play somente depois que o listener já está ativo
+    const playButton = frame.locator(
+      'button[aria-label="Play audio"], button[aria-label="Reproduzir áudio"], .rc-audiochallenge-play-button button'
+    ).first();
+    if (await playButton.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await playButton.click();
+    }
+
     const audioBuffer = await audioPromise;
 
-    // 3. Transcreve o áudio usando o speech.js
+    // 3. Transcreve o áudio com Whisper local
     const transcription = await transcriber.transcribe(audioBuffer);
-    
+
     if (!transcription || transcription.length < 3) {
       return { state: 'required', reason: 'transcription_failed' };
     }
 
-    // 4. Limpa a transcrição (remove pontuação e normaliza)
-    const cleanText = transcription.replace(/[^\p{L}\p{N}\s'-]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    // 4. Normaliza a transcrição
+    const cleanText = transcription
+      .normalize('NFKC')
+      .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
 
-    // 5. Preenche o campo de resposta
-    const inputField = frame.locator('input[type="text"][name="audio-response"]').first();
-    if (await inputField.isVisible()) {
+    // 5. Preenche o campo de resposta de áudio
+    const inputField = frame.locator(
+      'input[type="text"][name="audio-response"], .rc-audiochallenge-response-field input'
+    ).first();
+
+    if (await inputField.isVisible({ timeout: 3000 }).catch(() => false)) {
       await inputField.fill(cleanText);
-      
+
       // 6. Clica em Verificar
-      const verifyButton = frame.locator('button[aria-label="Verificar"]').first();
-      if (await verifyButton.isVisible()) {
+      const verifyButton = frame.locator(
+        'button[aria-label="Verificar"], button[aria-label="Verify"], #recaptcha-verify-button'
+      ).first();
+      if (await verifyButton.isVisible().catch(() => false)) {
         await verifyButton.click();
       }
 
