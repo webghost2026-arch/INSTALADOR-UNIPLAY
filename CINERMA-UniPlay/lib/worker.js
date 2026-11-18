@@ -110,8 +110,15 @@ class Worker {
         } else if (captchaResult.state === 'expired') {
           this.verification = { state: 'expired', reason: 'challenge_expired' };
           return 'captcha_expired';
+        } else if (captchaResult.state === 'error') {
+          // FIX-5: solver lançou erro interno (Whisper não instalado, timeout de captura, etc.)
+          // Antes caía no else silencioso → retornava 'login' → submitLogin sem token →
+          // servidor rejeitava → failures++ → backoff de 30s/60s/120s → "Três falhas".
+          // Agora retorna captcha_manual para o monitor aguardar ação humana sem submeter.
+          this.verification = { state: 'manual', reason: captchaResult.reason };
+          return 'captcha_manual';
         }
-        // Se não houver captcha visível ou não seja aplicável
+        // state: 'not_present' — sem captcha nesta sessão, prossegue normalmente
         this.verification = null;
         return 'login';
       }

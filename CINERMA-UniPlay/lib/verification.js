@@ -40,11 +40,12 @@ async function observeAndResolve(page, { autoSolve = true } = {}) {
   }
 
   try {
-    // FIX-1 — ESTRATÉGIA A: errorCallback resolve(null) em vez de reject()
-    // grecaptcha.execute() é para widgets invisible; em widgets v2 checkbox ele falha.
-    // Rejeitar aqui jogava todo o fluxo no catch e nunca chegava à Estratégia B.
-    // Agora resolve(null) garante que o fluxo continua normalmente para a Estratégia B.
-    const token = await page.evaluate((key) => {
+    // FIX-1 + FIX-4 — ESTRATÉGIA A com timeout de 2s
+    // grecaptcha.execute() é para widgets invisible; em widgets v2 checkbox ele nunca chama
+    // callback rapidamente — sem timeout ficava pendurado até o limite do Playwright (12s),
+    // bloqueando a Estratégia B e causando o backoff de 2 minutos no monitor.
+    // Agora: resolve(null) em até 2s, garantindo queda rápida para a Estratégia B.
+    const tokenPromise = page.evaluate((key) => {
       return new Promise((resolve) => {
         if (typeof grecaptcha !== 'undefined') {
           const existing = grecaptcha.getResponse();
@@ -54,17 +55,23 @@ async function observeAndResolve(page, { autoSolve = true } = {}) {
             try {
               grecaptcha.execute(key, {
                 callback: (response) => resolve(response || null),
-                errorCallback: () => resolve(null)   // FIX-1: não rejeita, apenas passa adiante
+                errorCallback: () => resolve(null)
               });
             } catch {
-              resolve(null);                           // FIX-1: execute() lança em widget v2
+              resolve(null);
             }
           }
         } else {
-          resolve(null);                               // FIX-1: biblioteca não carregada → Estratégia B
+          resolve(null);
         }
       });
     }, siteKey);
+
+    // FIX-4: timeout de 2s para a Estratégia A não pendurar o fluxo
+    const token = await Promise.race([
+      tokenPromise,
+      new Promise(resolve => setTimeout(() => resolve(null), 2000))
+    ]).catch(() => null);
 
     if (token && token.length > 20) {
       return { state: 'ready', token };
